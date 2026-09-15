@@ -40,6 +40,9 @@ const SOAP_ACTION = 'http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/
 // Unico empresa hoje (Delivery Pet) - se virar multi-tenant, buscar
 // CNPJ/estado da tabela `empresas` em vez de hardcode.
 const CNPJ = '52816710000198';
+// id real em `empresas` (existe uma 2a linha "Delivery Pet" orfa, sem CNPJ -
+// nao usar essa) - confirmado via `entradas.empresa_id` 15/09.
+const EMPRESA_ID = '3bce0e24-2868-49f3-a9dd-eed921ffc8e4';
 const C_UF_AUTOR = '33'; // RJ - usado na CONSULTA (distDFeInt), diferente do
 // evento de manifestacao, que usa cOrgao=91 (Ambiente Nacional) - achado
 // real 15/09: usar 33 ali rejeita com cStat 657 "Codigo do Orgao diverge
@@ -187,7 +190,7 @@ async function buscarNfePorChave(chave) {
     // ou a nota pode nem existir ainda (segue tentando os proximos passos).
   }
 
-  await sincronizar({ https, supabase, cnpj: CNPJ, cUFAutor: C_UF_AUTOR, tpAmb: TP_AMB, cert, key });
+  await sincronizar({ https, supabase, cnpj: CNPJ, empresaId: EMPRESA_ID, cUFAutor: C_UF_AUTOR, tpAmb: TP_AMB, cert, key });
 
   const doCacheDepoisDoSync = await buscarNoCache(supabase, chaveLimpa);
   if (doCacheDepoisDoSync) return { status: 200, body: { ok: true, xml: doCacheDepoisDoSync } };
@@ -267,7 +270,7 @@ async function rodarPollDeFundo() {
       obterSegredo('nfe_certificado_cert_pem'),
       obterSegredo('nfe_certificado_key_pem'),
     ]);
-    await sincronizar({ https, supabase: getSupabaseAdmin(), cnpj: CNPJ, cUFAutor: C_UF_AUTOR, tpAmb: TP_AMB, cert, key });
+    await sincronizar({ https, supabase: getSupabaseAdmin(), cnpj: CNPJ, empresaId: EMPRESA_ID, cUFAutor: C_UF_AUTOR, tpAmb: TP_AMB, cert, key });
   } catch (e) {
     console.error('Poll de fundo (distNSU) falhou:', sanitizarErro(e && e.message));
   }

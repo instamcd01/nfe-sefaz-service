@@ -107,16 +107,16 @@ async function salvarEstado(supabase, cnpj, { ultimoNsu, semNovidadeAgora }) {
   if (error) throw new Error(`Falha salvando nfe_sync_estado: ${error.message}`);
 }
 
-async function cachearNfe(supabase, chave, xml, nsu) {
+async function cachearNfe(supabase, chave, xml, nsu, empresaId) {
   const { error } = await supabase
     .from('nfe_cache_distribuicao')
-    .upsert({ chave, xml, nsu, recebido_em: new Date().toISOString() }, { onConflict: 'chave' });
+    .upsert({ chave, xml, nsu, empresa_id: empresaId, recebido_em: new Date().toISOString() }, { onConflict: 'chave' });
   if (error) throw new Error(`Falha salvando nfe_cache_distribuicao: ${error.message}`);
 }
 
 /** Processa os documentos de um lote de distNSU: cacheia procNFe completos
  * e manifesta Ciencia da Operacao pros resNFe (resumo) ainda nao vistos. */
-async function processarDocumentos(supabase, docs, { cnpj, cert, key }) {
+async function processarDocumentos(supabase, docs, { cnpj, empresaId, cert, key }) {
   for (const doc of docs) {
     let xml;
     try {
@@ -127,7 +127,7 @@ async function processarDocumentos(supabase, docs, { cnpj, cert, key }) {
 
     if (doc.schema.startsWith('procNFe')) {
       const m = xml.match(/Id="NFe(\d{44})"/);
-      if (m) await cachearNfe(supabase, m[1], xml, doc.nsu);
+      if (m) await cachearNfe(supabase, m[1], xml, doc.nsu, empresaId);
       continue;
     }
 
@@ -154,7 +154,7 @@ async function processarDocumentos(supabase, docs, { cnpj, cert, key }) {
  * salvo ate a Sefaz dizer "nenhum documento a mais" (cStat 137) ou até
  * `maxLotes` lotes (protecao contra loop infinito). Respeita o cooldown de
  * 1h da Sefaz depois de um 137 anterior - nesse caso nao faz nada. */
-async function sincronizar({ https, supabase, cnpj, cUFAutor, tpAmb, cert, key, maxLotes = 5 }) {
+async function sincronizar({ https, supabase, cnpj, empresaId, cUFAutor, tpAmb, cert, key, maxLotes = 5 }) {
   if (sincronizando) return { pulou: true, motivo: 'sincronizacao_em_andamento' };
   sincronizando = true;
   try {
@@ -204,7 +204,7 @@ async function sincronizar({ https, supabase, cnpj, cUFAutor, tpAmb, cert, key, 
       const docs = [...resposta.corpo.matchAll(/<docZip NSU="([^"]*)" schema="([^"]*)">([^<]*)<\/docZip>/g)].map(
         ([, nsu, schema, conteudo]) => ({ nsu, schema, conteudo }),
       );
-      await processarDocumentos(supabase, docs, { cnpj, cert, key });
+      await processarDocumentos(supabase, docs, { cnpj, empresaId, cert, key });
       documentosProcessados += docs.length;
 
       ultNSU = novoUltNSU || ultNSU;
