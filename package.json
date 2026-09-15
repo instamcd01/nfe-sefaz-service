@@ -9,7 +9,11 @@
     "start": "node src/index.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0"
+    "@supabase/supabase-js": "^2.45.0",
+    "xml-crypto": "^6.1.2"
+  },
+  "overrides": {
+    "@xmldom/xmldom": "^0.9.12"
   },
   "engines": {
     "node": ">=20"

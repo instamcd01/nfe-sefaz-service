@@ -25,6 +25,7 @@ const http = require('http');
 const https = require('https');
 const zlib = require('zlib');
 const { createClient } = require('@supabase/supabase-js');
+const { manifestarCienciaDaOperacao } = require('./manifestacao');
 
 const PORT = process.env.PORT || 3000;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
@@ -38,7 +39,10 @@ const SOAP_ACTION = 'http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/
 // Unico empresa hoje (Delivery Pet) - se virar multi-tenant, buscar
 // CNPJ/estado da tabela `empresas` em vez de hardcode.
 const CNPJ = '52816710000198';
-const C_UF_AUTOR = '33'; // RJ
+const C_UF_AUTOR = '33'; // RJ - usado na CONSULTA (distDFeInt), diferente do
+// evento de manifestacao, que usa cOrgao=91 (Ambiente Nacional) - achado
+// real 15/09: usar 33 ali rejeita com cStat 657 "Codigo do Orgao diverge
+// do orgao autorizador".
 const TP_AMB = '1'; // 1 = producao, 2 = homologacao
 
 // Defesa contra qualquer erro que por algum motivo acabe incluindo o
@@ -127,6 +131,26 @@ function postSoap(cert, key, soapBody) {
   });
 }
 
+/** Uma tentativa de consChNFe — devolve o docZip decodificado se achou,
+ * ou {cStat, xMotivo} se não. Não decide o que fazer com "não
+ * encontrado" — quem chama (buscarNfePorChave) decide se tenta
+ * manifestar e repetir. */
+async function consultarUmaVez(chaveLimpa, cert, key) {
+  const resposta = await postSoap(cert, key, montarSoap(chaveLimpa));
+  if (resposta.statusCode < 200 || resposta.statusCode >= 300) {
+    throw new Error(`Sefaz retornou HTTP ${resposta.statusCode} na consulta.`);
+  }
+
+  const cStat = extrairTag(resposta.corpo, 'cStat');
+  const xMotivo = extrairTag(resposta.corpo, 'xMotivo');
+  const docZipMatch = resposta.corpo.match(/<docZip[^>]*schema="([^"]*)"[^>]*>([^<]*)<\/docZip>/i);
+
+  if (!docZipMatch) return { encontrado: false, cStat, xMotivo };
+
+  const xml = zlib.gunzipSync(Buffer.from(docZipMatch[2], 'base64')).toString('utf-8');
+  return { encontrado: true, xml };
+}
+
 async function buscarNfePorChave(chave) {
   const chaveLimpa = String(chave || '').replace(/\D/g, '');
   if (chaveLimpa.length !== 44) {
@@ -138,32 +162,55 @@ async function buscarNfePorChave(chave) {
     obterSegredo('nfe_certificado_key_pem'),
   ]);
 
-  const resposta = await postSoap(cert, key, montarSoap(chaveLimpa));
+  let resultado = await consultarUmaVez(chaveLimpa, cert, key);
 
-  if (resposta.statusCode < 200 || resposta.statusCode >= 300) {
-    return { status: 502, body: { ok: false, erro: 'falha_busca', mensagem: `Sefaz retornou HTTP ${resposta.statusCode}.` } };
+  // cStat 137 "Nenhum documento localizado" quase sempre significa que o
+  // destinatário nunca manifestou ciência dessa nota — a Sefaz só libera
+  // o documento completo por consChNFe depois disso (confirmado pela NT
+  // 2014.002 oficial e testado empiricamente 15/09). Manifesta
+  // automaticamente e tenta de novo, uma vez só — não entra em loop se
+  // continuar não encontrado por outro motivo (nota realmente não
+  // existe, chave errada, etc).
+  if (!resultado.encontrado && resultado.cStat === '137') {
+    const manifestacao = await manifestarCienciaDaOperacao({
+      chave: chaveLimpa,
+      cnpj: CNPJ,
+      cOrgao: '91', // Ambiente Nacional — ver comentário em C_UF_AUTOR
+      tpAmb: TP_AMB,
+      cert,
+      key,
+    });
+
+    if (manifestacao.ok) {
+      resultado = await consultarUmaVez(chaveLimpa, cert, key);
+    } else {
+      return {
+        status: 502,
+        body: {
+          ok: false,
+          erro: 'falha_manifestacao',
+          mensagem: manifestacao.xMotivo || 'Não foi possível registrar a ciência da operação pra essa nota.',
+          cStat: manifestacao.cStat,
+        },
+      };
+    }
   }
 
-  const cStat = extrairTag(resposta.corpo, 'cStat');
-  const xMotivo = extrairTag(resposta.corpo, 'xMotivo');
-  const docZipMatch = resposta.corpo.match(/<docZip[^>]*schema="([^"]*)"[^>]*>([^<]*)<\/docZip>/i);
-
-  if (!docZipMatch) {
-    const erro = cStat === '137' ? 'nao_encontrada' : 'falha_busca';
-    const status = cStat === '137' ? 404 : 502;
+  if (!resultado.encontrado) {
+    const erro = resultado.cStat === '137' ? 'nao_encontrada' : 'falha_busca';
+    const status = resultado.cStat === '137' ? 404 : 502;
     return {
       status,
       body: {
         ok: false,
         erro,
-        mensagem: xMotivo || 'NF-e nao encontrada na Sefaz pra essa chave de acesso, ou nenhum documento retornado.',
-        cStat,
+        mensagem: resultado.xMotivo || 'NF-e nao encontrada na Sefaz pra essa chave de acesso, ou nenhum documento retornado.',
+        cStat: resultado.cStat,
       },
     };
   }
 
-  const xml = zlib.gunzipSync(Buffer.from(docZipMatch[2], 'base64')).toString('utf-8');
-  return { status: 200, body: { ok: true, xml } };
+  return { status: 200, body: { ok: true, xml: resultado.xml } };
 }
 
 const server = http.createServer((req, res) => {
