@@ -26,6 +26,7 @@ const https = require('https');
 const zlib = require('zlib');
 const { createClient } = require('@supabase/supabase-js');
 const { manifestarCienciaDaOperacao } = require('./manifestacao');
+const { sincronizar, buscarNoCache } = require('./sync');
 
 const PORT = process.env.PORT || 3000;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
@@ -157,60 +158,58 @@ async function buscarNfePorChave(chave) {
     return { status: 400, body: { ok: false, erro: 'chave_invalida', mensagem: 'Chave de acesso precisa ter 44 digitos.' } };
   }
 
+  const supabase = getSupabaseAdmin();
+
+  // Fonte de verdade: cache alimentado pelo poll continuo de distNSU (ver
+  // sync.js). Achado real 15/09: consChNFe (busca pontual por chave) tem
+  // um indice proprio na Sefaz que fica dessincronizado do indice de
+  // distNSU - uma nota ja autorizada e ja manifestada continuava dando
+  // cStat 137 via consChNFe, mas aparecia na hora via distNSU (testado
+  // direto contra a Sefaz). Por isso consChNFe deixou de ser o caminho
+  // principal e virou so um ultimo recurso, abaixo.
+  const doCache = await buscarNoCache(supabase, chaveLimpa);
+  if (doCache) return { status: 200, body: { ok: true, xml: doCache } };
+
   const [cert, key] = await Promise.all([
     obterSegredo('nfe_certificado_cert_pem'),
     obterSegredo('nfe_certificado_key_pem'),
   ]);
 
-  let resultado = await consultarUmaVez(chaveLimpa, cert, key);
-
-  // cStat 137 "Nenhum documento localizado" quase sempre significa que o
-  // destinatário nunca manifestou ciência dessa nota — a Sefaz só libera
-  // o documento completo por consChNFe depois disso (confirmado pela NT
-  // 2014.002 oficial e testado empiricamente 15/09). Manifesta
-  // automaticamente e tenta de novo, uma vez só — não entra em loop se
-  // continuar não encontrado por outro motivo (nota realmente não
-  // existe, chave errada, etc).
-  if (!resultado.encontrado && resultado.cStat === '137') {
-    const manifestacao = await manifestarCienciaDaOperacao({
-      chave: chaveLimpa,
-      cnpj: CNPJ,
-      cOrgao: '91', // Ambiente Nacional — ver comentário em C_UF_AUTOR
-      tpAmb: TP_AMB,
-      cert,
-      key,
-    });
-
-    if (manifestacao.ok) {
-      resultado = await consultarUmaVez(chaveLimpa, cert, key);
-    } else {
-      return {
-        status: 502,
-        body: {
-          ok: false,
-          erro: 'falha_manifestacao',
-          mensagem: manifestacao.xMotivo || 'Não foi possível registrar a ciência da operação pra essa nota.',
-          cStat: manifestacao.cStat,
-        },
-      };
-    }
+  // Nao esta no cache ainda - pode ser nota nova que o poll de fundo nao
+  // pegou. Manifesta na hora (idempotente o bastante - se ja manifestada
+  // a Sefaz so rejeita o evento duplicado) pra garantir que a nota entra
+  // na esteira do distNSU, depois forca uma rodada de sincronizacao sob
+  // demanda (respeita o cooldown de 1h da Sefaz sozinho).
+  try {
+    await manifestarCienciaDaOperacao({ chave: chaveLimpa, cnpj: CNPJ, cOrgao: '91', tpAmb: TP_AMB, cert, key });
+  } catch (e) {
+    // Erro aqui nao deve travar o fluxo - a manifestacao pode ja existir,
+    // ou a nota pode nem existir ainda (segue tentando os proximos passos).
   }
 
-  if (!resultado.encontrado) {
-    const erro = resultado.cStat === '137' ? 'nao_encontrada' : 'falha_busca';
-    const status = resultado.cStat === '137' ? 404 : 502;
-    return {
-      status,
-      body: {
-        ok: false,
-        erro,
-        mensagem: resultado.xMotivo || 'NF-e nao encontrada na Sefaz pra essa chave de acesso, ou nenhum documento retornado.',
-        cStat: resultado.cStat,
-      },
-    };
+  await sincronizar({ https, supabase, cnpj: CNPJ, cUFAutor: C_UF_AUTOR, tpAmb: TP_AMB, cert, key });
+
+  const doCacheDepoisDoSync = await buscarNoCache(supabase, chaveLimpa);
+  if (doCacheDepoisDoSync) return { status: 200, body: { ok: true, xml: doCacheDepoisDoSync } };
+
+  // Ultimo recurso: tenta consChNFe mesmo sabendo do desvio de indice -
+  // em alguns casos pode funcionar (nota que ja tinha sido manifestada
+  // antes de existir esse cache, por exemplo).
+  const resultado = await consultarUmaVez(chaveLimpa, cert, key);
+  if (resultado.encontrado) {
+    return { status: 200, body: { ok: true, xml: resultado.xml } };
   }
 
-  return { status: 200, body: { ok: true, xml: resultado.xml } };
+  return {
+    status: 404,
+    body: {
+      ok: false,
+      erro: 'nao_encontrada',
+      mensagem:
+        'NF-e ainda nao sincronizada com a Sefaz pra essa chave de acesso. Se a nota acabou de ser emitida, tente de novo em alguns minutos.',
+      cStat: resultado.cStat,
+    },
+  };
 }
 
 const server = http.createServer((req, res) => {
@@ -258,6 +257,24 @@ const server = http.createServer((req, res) => {
   });
 });
 
+// Poll de fundo: mantem o cache quente sem depender de ninguem escanear
+// nada. sincronizar() ja e no-op sozinho durante o cooldown de 1h da
+// Sefaz, entao pode rodar num intervalo curto sem risco de 656.
+const INTERVALO_POLL_MS = 5 * 60 * 1000;
+async function rodarPollDeFundo() {
+  try {
+    const [cert, key] = await Promise.all([
+      obterSegredo('nfe_certificado_cert_pem'),
+      obterSegredo('nfe_certificado_key_pem'),
+    ]);
+    await sincronizar({ https, supabase: getSupabaseAdmin(), cnpj: CNPJ, cUFAutor: C_UF_AUTOR, tpAmb: TP_AMB, cert, key });
+  } catch (e) {
+    console.error('Poll de fundo (distNSU) falhou:', sanitizarErro(e && e.message));
+  }
+}
+
 server.listen(PORT, () => {
   console.log(`nfe-sefaz-service ouvindo na porta ${PORT}`);
+  rodarPollDeFundo();
+  setInterval(rodarPollDeFundo, INTERVALO_POLL_MS);
 });
